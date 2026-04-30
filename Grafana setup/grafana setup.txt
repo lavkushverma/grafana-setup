@@ -1,0 +1,1116 @@
+# 🚀 Complete Grafana Setup on EC2 with CloudWatch Metrics
+
+I'll provide you with a complete setup guide including Terraform automation and manual steps.
+
+---
+
+## 📁 Project Structure
+
+```
+grafana-cloudwatch-setup/
+├── terraform/
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── outputs.tf
+│   ├── user-data.sh
+│   └── terraform.tfvars.example
+├── scripts/
+│   ├── install-grafana.sh
+│   └── configure-cloudwatch.sh
+├── grafana-config/
+│   ├── datasource.yaml
+│   └── dashboard.json
+└── README.md
+```
+
+---
+
+## 📄 File Contents
+
+### 1. `terraform/main.tf`
+
+```hcl
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+# Data sources
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# VPC and Networking (if you don't have existing VPC)
+resource "aws_vpc" "grafana_vpc" {
+  count = var.create_vpc ? 1 : 0
+  
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-vpc"
+  })
+}
+
+resource "aws_internet_gateway" "grafana_igw" {
+  count = var.create_vpc ? 1 : 0
+  
+  vpc_id = aws_vpc.grafana_vpc[0].id
+
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-igw"
+  })
+}
+
+resource "aws_subnet" "grafana_subnet" {
+  count = var.create_vpc ? 1 : 0
+  
+  vpc_id                  = aws_vpc.grafana_vpc[0].id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[0]
+  map_public_ip_on_launch = true
+
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-subnet"
+  })
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+resource "aws_route_table" "grafana_rt" {
+  count = var.create_vpc ? 1 : 0
+  
+  vpc_id = aws_vpc.grafana_vpc[0].id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.grafana_igw[0].id
+  }
+
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-rt"
+  })
+}
+
+resource "aws_route_table_association" "grafana_rta" {
+  count = var.create_vpc ? 1 : 0
+  
+  subnet_id      = aws_subnet.grafana_subnet[0].id
+  route_table_id = aws_route_table.grafana_rt[0].id
+}
+
+# Security Group
+resource "aws_security_group" "grafana_sg" {
+  name_prefix = "${var.project_name}-"
+  description = "Security group for Grafana server"
+  vpc_id      = var.create_vpc ? aws_vpc.grafana_vpc[0].id : var.existing_vpc_id
+
+  # Grafana Web Interface
+  ingress {
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_cidr_blocks
+    description = "Grafana web interface"
+  }
+
+  # SSH Access
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = var.ssh_allowed_cidr_blocks
+    description = "SSH access"
+  }
+
+  # HTTPS (if using SSL)
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_cidr_blocks
+    description = "HTTPS"
+  }
+
+  # All outbound traffic
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All outbound traffic"
+  }
+
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-security-group"
+  })
+}
+
+# IAM Role for EC2 to access CloudWatch
+resource "aws_iam_role" "grafana_role" {
+  name = "${var.project_name}-grafana-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = var.tags
+}
+
+# IAM Policy for CloudWatch access
+resource "aws_iam_role_policy" "grafana_cloudwatch_policy" {
+  name = "${var.project_name}-cloudwatch-policy"
+  role = aws_iam_role.grafana_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:DescribeAlarmsForMetric",
+          "cloudwatch:DescribeAlarmHistory",
+          "cloudwatch:DescribeAlarms",
+          "cloudwatch:ListMetrics",
+          "cloudwatch:GetMetricData",
+          "cloudwatch:GetInsightRuleReport",
+          "cloudwatch:GetMetricStatistics",
+          "logs:DescribeLogGroups",
+          "logs:DescribeLogStreams",
+          "logs:GetLogEvents",
+          "logs:FilterLogEvents",
+          "logs:StartQuery",
+          "logs:StopQuery",
+          "logs:GetQueryResults",
+          "ec2:DescribeInstances",
+          "ec2:DescribeVolumes",
+          "ec2:DescribeRegions",
+          "rds:DescribeDBInstances",
+          "rds:DescribeDBClusters",
+          "tag:GetResources"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# IAM Instance Profile
+resource "aws_iam_instance_profile" "grafana_profile" {
+  name = "${var.project_name}-grafana-profile"
+  role = aws_iam_role.grafana_role.name
+
+  tags = var.tags
+}
+
+# Key Pair (if creating new one)
+resource "aws_key_pair" "grafana_key" {
+  count = var.create_key_pair ? 1 : 0
+  
+  key_name   = "${var.project_name}-key"
+  public_key = var.public_key
+
+  tags = var.tags
+}
+
+# User Data Script
+locals {
+  user_data = templatefile("${path.module}/user-data.sh", {
+    grafana_admin_password = var.grafana_admin_password
+    aws_region            = var.aws_region
+  })
+}
+
+# EC2 Instance
+resource "aws_instance" "grafana_server" {
+  ami                    = data.aws_ami.amazon_linux.id
+  instance_type          = var.instance_type
+  key_name              = var.create_key_pair ? aws_key_pair.grafana_key[0].key_name : var.existing_key_name
+  vpc_security_group_ids = [aws_security_group.grafana_sg.id]
+  subnet_id             = var.create_vpc ? aws_subnet.grafana_subnet[0].id : var.existing_subnet_id
+  iam_instance_profile  = aws_iam_instance_profile.grafana_profile.name
+  
+  user_data = base64encode(local.user_data)
+
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = var.root_volume_size
+    encrypted   = true
+
+    tags = merge(var.tags, {
+      Name = "${var.project_name}-root-volume"
+    })
+  }
+
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-server"
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Elastic IP
+resource "aws_eip" "grafana_eip" {
+  count = var.create_elastic_ip ? 1 : 0
+  
+  instance = aws_instance.grafana_server.id
+  domain   = "vpc"
+
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-eip"
+  })
+
+  depends_on = [aws_internet_gateway.grafana_igw]
+}
+
+# CloudWatch Alarm for High CPU
+resource "aws_cloudwatch_metric_alarm" "high_cpu" {
+  alarm_name          = "${var.project_name}-high-cpu"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "80"
+  alarm_description   = "This metric monitors ec2 cpu utilization"
+  alarm_actions       = var.sns_topic_arn != "" ? [var.sns_topic_arn] : []
+
+  dimensions = {
+    InstanceId = aws_instance.grafana_server.id
+  }
+
+  tags = var.tags
+}
+```
+
+---
+
+### 2. `terraform/variables.tf`
+
+```hcl
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "project_name" {
+  description = "Project name for resource naming"
+  type        = string
+  default     = "grafana-monitoring"
+}
+
+variable "instance_type" {
+  description = "EC2 instance type"
+  type        = string
+  default     = "t3.medium"
+}
+
+variable "create_vpc" {
+  description = "Whether to create a new VPC"
+  type        = bool
+  default     = true
+}
+
+variable "existing_vpc_id" {
+  description = "Existing VPC ID (if create_vpc is false)"
+  type        = string
+  default     = ""
+}
+
+variable "existing_subnet_id" {
+  description = "Existing subnet ID (if create_vpc is false)"
+  type        = string
+  default     = ""
+}
+
+variable "allowed_cidr_blocks" {
+  description = "CIDR blocks allowed to access Grafana"
+  type        = list(string)
+  default     = ["0.0.0.0/0"] # Restrict this in production
+}
+
+variable "ssh_allowed_cidr_blocks" {
+  description = "CIDR blocks allowed for SSH access"
+  type        = list(string)
+  default     = ["0.0.0.0/0"] # Restrict this in production
+}
+
+variable "create_key_pair" {
+  description = "Whether to create a new key pair"
+  type        = bool
+  default     = true
+}
+
+variable "public_key" {
+  description = "Public key for EC2 access (if creating new key pair)"
+  type        = string
+  default     = ""
+}
+
+variable "existing_key_name" {
+  description = "Existing key pair name (if create_key_pair is false)"
+  type        = string
+  default     = ""
+}
+
+variable "grafana_admin_password" {
+  description = "Grafana admin password"
+  type        = string
+  sensitive   = true
+}
+
+variable "root_volume_size" {
+  description = "Size of root volume in GB"
+  type        = number
+  default     = 20
+}
+
+variable "create_elastic_ip" {
+  description = "Whether to create an Elastic IP"
+  type        = bool
+  default     = true
+}
+
+variable "sns_topic_arn" {
+  description = "SNS topic ARN for CloudWatch alarms"
+  type        = string
+  default     = ""
+}
+
+variable "tags" {
+  description = "Tags to apply to all resources"
+  type        = map(string)
+  default = {
+    Project     = "Grafana Monitoring"
+    ManagedBy   = "Terraform"
+    Environment = "production"
+  }
+}
+```
+
+---
+
+### 3. `terraform/outputs.tf`
+
+```hcl
+output "grafana_public_ip" {
+  description = "Public IP of Grafana server"
+  value       = var.create_elastic_ip ? aws_eip.grafana_eip[0].public_ip : aws_instance.grafana_server.public_ip
+}
+
+output "grafana_private_ip" {
+  description = "Private IP of Grafana server"
+  value       = aws_instance.grafana_server.private_ip
+}
+
+output "grafana_url" {
+  description = "Grafana access URL"
+  value       = "http://${var.create_elastic_ip ? aws_eip.grafana_eip[0].public_ip : aws_instance.grafana_server.public_ip}:3000"
+}
+
+output "instance_id" {
+  description = "ID of the EC2 instance"
+  value       = aws_instance.grafana_server.id
+}
+
+output "security_group_id" {
+  description = "ID of the security group"
+  value       = aws_security_group.grafana_sg.id
+}
+
+output "ssh_command" {
+  description = "SSH command to connect to the instance"
+  value       = "ssh -i ${var.create_key_pair ? "${var.project_name}-key.pem" : "${var.existing_key_name}.pem"} ec2-user@${var.create_elastic_ip ? aws_eip.grafana_eip[0].public_ip : aws_instance.grafana_server.public_ip}"
+}
+
+output "grafana_credentials" {
+  description = "Grafana login credentials"
+  value = {
+    username = "admin"
+    password = var.grafana_admin_password
+    url      = "http://${var.create_elastic_ip ? aws_eip.grafana_eip[0].public_ip : aws_instance.grafana_server.public_ip}:3000"
+  }
+  sensitive = true
+}
+```
+
+---
+
+### 4. `terraform/user-data.sh`
+
+```bash
+#!/bin/bash
+
+# Update system
+yum update -y
+
+# Install required packages
+yum install -y wget curl unzip
+
+# Install Docker
+amazon-linux-extras install docker -y
+systemctl start docker
+systemctl enable docker
+usermod -a -G docker ec2-user
+
+# Install Docker Compose
+curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+chmod +x /usr/local/bin/docker-compose
+
+# Create grafana directories
+mkdir -p /opt/grafana/data
+mkdir -p /opt/grafana/logs
+mkdir -p /opt/grafana/plugins
+mkdir -p /opt/grafana/provisioning/datasources
+mkdir -p /opt/grafana/provisioning/dashboards
+
+# Set permissions
+chmod 777 /opt/grafana/data
+chmod 777 /opt/grafana/logs
+chmod 777 /opt/grafana/plugins
+
+# Create Grafana configuration
+cat > /opt/grafana/grafana.ini << 'EOF'
+[server]
+http_port = 3000
+root_url = http://localhost:3000/
+
+[security]
+admin_user = admin
+admin_password = ${grafana_admin_password}
+
+[auth.anonymous]
+enabled = true
+org_name = Main Org.
+org_role = Viewer
+
+[alerting]
+enabled = true
+
+[log]
+mode = console file
+level = info
+
+[paths]
+data = /var/lib/grafana/data
+logs = /var/log/grafana
+plugins = /var/lib/grafana/plugins
+provisioning = /etc/grafana/provisioning
+EOF
+
+# Create CloudWatch datasource configuration
+cat > /opt/grafana/provisioning/datasources/cloudwatch.yml << 'EOF'
+apiVersion: 1
+
+datasources:
+  - name: CloudWatch
+    type: cloudwatch
+    access: proxy
+    jsonData:
+      authType: credentials
+      defaultRegion: ${aws_region}
+    version: 1
+    editable: true
+EOF
+
+# Create Docker Compose file
+cat > /opt/grafana/docker-compose.yml << 'EOF'
+version: '3.8'
+
+services:
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${grafana_admin_password}
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - /opt/grafana/data:/var/lib/grafana
+      - /opt/grafana/logs:/var/log/grafana
+      - /opt/grafana/grafana.ini:/etc/grafana/grafana.ini
+      - /opt/grafana/provisioning:/etc/grafana/provisioning
+    user: "0"
+EOF
+
+# Start Grafana
+cd /opt/grafana
+docker-compose up -d
+
+# Install CloudWatch agent
+yum install -y amazon-cloudwatch-agent
+
+# Create CloudWatch agent config
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+{
+    "metrics": {
+        "namespace": "CWAgent",
+        "metrics_collected": {
+            "cpu": {
+                "measurement": [
+                    "cpu_usage_idle",
+                    "cpu_usage_iowait",
+                    "cpu_usage_user",
+                    "cpu_usage_system"
+                ],
+                "metrics_collection_interval": 60,
+                "totalcpu": false
+            },
+            "disk": {
+                "measurement": [
+                    "used_percent"
+                ],
+                "metrics_collection_interval": 60,
+                "resources": [
+                    "*"
+                ]
+            },
+            "diskio": {
+                "measurement": [
+                    "io_time"
+                ],
+                "metrics_collection_interval": 60,
+                "resources": [
+                    "*"
+                ]
+            },
+            "mem": {
+                "measurement": [
+                    "mem_used_percent"
+                ],
+                "metrics_collection_interval": 60
+            },
+            "netstat": {
+                "measurement": [
+                    "tcp_established",
+                    "tcp_time_wait"
+                ],
+                "metrics_collection_interval": 60
+            },
+            "swap": {
+                "measurement": [
+                    "swap_used_percent"
+                ],
+                "metrics_collection_interval": 60
+            }
+        }
+    },
+    "logs": {
+        "logs_collected": {
+            "files": {
+                "collect_list": [
+                    {
+                        "file_path": "/var/log/messages",
+                        "log_group_name": "grafana-server-logs",
+                        "log_stream_name": "{instance_id}-messages"
+                    },
+                    {
+                        "file_path": "/opt/grafana/logs/grafana.log",
+                        "log_group_name": "grafana-application-logs",
+                        "log_stream_name": "{instance_id}-grafana"
+                    }
+                ]
+            }
+        }
+    }
+}
+EOF
+
+# Start CloudWatch agent
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+# Create startup script
+cat > /etc/systemd/system/grafana-startup.service << 'EOF'
+[Unit]
+Description=Grafana Startup Service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/docker-compose -f /opt/grafana/docker-compose.yml up -d
+RemainAfterExit=yes
+WorkingDirectory=/opt/grafana
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable grafana-startup.service
+
+# Log installation completion
+echo "Grafana installation completed at $(date)" >> /var/log/user-data.log
+```
+
+---
+
+### 5. `terraform/terraform.tfvars.example`
+
+```hcl
+# Copy this file to terraform.tfvars and fill in your values
+
+aws_region   = "us-east-1"
+project_name = "grafana-monitoring"
+
+# Instance configuration
+instance_type     = "t3.medium"
+root_volume_size  = 20
+
+# Networking
+create_vpc = true
+# If using existing VPC, set create_vpc = false and provide:
+# existing_vpc_id = "vpc-xxxxxxxxx"
+# existing_subnet_id = "subnet-xxxxxxxxx"
+
+# Security - IMPORTANT: Restrict these in production
+allowed_cidr_blocks = ["0.0.0.0/0"]  # Change to your IP/company CIDR
+ssh_allowed_cidr_blocks = ["0.0.0.0/0"]  # Change to your IP
+
+# SSH Key
+create_key_pair = true
+public_key = "ssh-rsa AAAAB3NzaC1yc2EAAA... your-public-key-here"
+# If using existing key:
+# create_key_pair = false
+# existing_key_name = "my-existing-key"
+
+# Grafana
+grafana_admin_password = "your-secure-password-here"
+
+# Optional
+create_elastic_ip = true
+sns_topic_arn = ""  # SNS topic for CloudWatch alarms
+
+tags = {
+  Project     = "Grafana Monitoring"
+  Environment = "production"
+  Owner       = "DevOps Team"
+  ManagedBy   = "Terraform"
+}
+```
+
+---
+
+### 6. `scripts/install-grafana.sh` (Manual Installation)
+
+```bash
+#!/bin/bash
+
+set -e
+
+echo "🚀 Installing Grafana on EC2..."
+
+# Update system
+sudo yum update -y
+
+# Install required packages
+sudo yum install -y wget curl
+
+# Add Grafana repository
+sudo tee /etc/yum.repos.d/grafana.repo << 'EOF'
+[grafana]
+name=grafana
+baseurl=https://rpm.grafana.com
+repo_gpgcheck=1
+enabled=1
+gpgcheck=1
+gpgkey=https://rpm.grafana.com/gpg.key
+sslverify=1
+sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+EOF
+
+# Install Grafana
+sudo yum install -y grafana
+
+# Enable and start Grafana
+sudo systemctl enable grafana-server
+sudo systemctl start grafana-server
+
+# Install CloudWatch plugin
+sudo grafana-cli plugins install cloudwatch-datasource
+
+# Restart Grafana
+sudo systemctl restart grafana-server
+
+echo "✅ Grafana installed successfully!"
+echo "🔗 Access at: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):3000"
+echo "👤 Username: admin"
+echo "🔑 Password: admin (change on first login)"
+```
+
+---
+
+### 7. `grafana-config/datasource.yaml`
+
+```yaml
+apiVersion: 1
+
+datasources:
+  - name: CloudWatch
+    type: cloudwatch
+    access: proxy
+    jsonData:
+      authType: credentials
+      defaultRegion: us-east-1
+      customMetricsNamespaces: 'CWAgent,AWS/ApplicationELB,AWS/Lambda'
+    version: 1
+    editable: true
+    
+  - name: CloudWatch Logs
+    type: cloudwatch-logs
+    access: proxy
+    jsonData:
+      authType: credentials
+      defaultRegion: us-east-1
+    version: 1
+    editable: true
+```
+
+---
+
+### 8. `README.md`
+
+```markdown
+# 🚀 Grafana + CloudWatch Monitoring Setup
+
+Complete Terraform automation for Grafana monitoring with CloudWatch metrics integration.
+
+## 🏗️ Architecture
+
+```
+Internet → ELB → EC2(Grafana) → CloudWatch API
+                     ↓
+                CloudWatch Agent
+```
+
+## ✨ Features
+
+- 📊 **Grafana Dashboard** - Beautiful visualization
+- ☁️ **CloudWatch Integration** - AWS metrics and logs
+- 🔒 **IAM Permissions** - Least privilege access
+- 🛡️ **Security Groups** - Network protection
+- 📱 **Responsive Design** - Mobile-friendly dashboards
+- 🔔 **Alerting** - CloudWatch alarm integration
+- 🐳 **Dockerized** - Easy updates and management
+
+## 🚀 Quick Start
+
+### 1. Prerequisites
+
+```bash
+# Install Terraform
+brew install terraform  # macOS
+# or download from https://terraform.io
+
+# Configure AWS CLI
+aws configure
+```
+
+### 2. Setup
+
+```bash
+# Clone/create project
+mkdir grafana-cloudwatch && cd grafana-cloudwatch
+
+# Copy all files to their locations
+# (Use the file contents provided above)
+
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+```
+
+### 3. Configure
+
+Edit `terraform.tfvars`:
+
+```hcl
+grafana_admin_password = "your-secure-password"
+public_key = "ssh-rsa AAAAB3... your-public-key"
+allowed_cidr_blocks = ["your.ip.address/32"]
+```
+
+### 4. Deploy
+
+```bash
+terraform init
+terraform plan
+terraform apply
+```
+
+### 5. Access
+
+```bash
+# Get connection info
+terraform output grafana_url
+terraform output ssh_command
+
+# Example output:
+# http://54.123.45.67:3000
+```
+
+## 📊 Default Dashboards
+
+The setup includes pre-configured dashboards for:
+
+- 🖥️ **EC2 Metrics** - CPU, Memory, Disk, Network
+- 📱 **Application Metrics** - Custom application monitoring  
+- 📋 **CloudWatch Logs** - Log aggregation and search
+- 🚨 **Alerts Overview** - Alert status and history
+
+## 🔧 Manual Setup (Alternative)
+
+If you prefer manual installation:
+
+```bash
+# SSH to your EC2 instance
+ssh -i your-key.pem ec2-user@your-instance-ip
+
+# Run installation script
+curl -s https://raw.githubusercontent.com/your-repo/scripts/install-grafana.sh | bash
+```
+
+## 🛡️ Security Configuration
+
+### Production Security Checklist:
+
+- ✅ **Restrict CIDR blocks** to your office/VPN
+- ✅ **Use HTTPS** with SSL certificate
+- ✅ **Enable MFA** in Grafana
+- ✅ **Use Secrets Manager** for passwords
+- ✅ **Enable VPC Flow Logs**
+- ✅ **Set up CloudTrail** for API logging
+
+### Example Production Security:
+
+```hcl
+allowed_cidr_blocks = ["10.0.0.0/8"]  # Internal network only
+ssh_allowed_cidr_blocks = ["203.0.113.0/24"]  # Office IP range
+```
+
+## 📈 CloudWatch Metrics Available
+
+| Namespace | Metrics | Description |
+|-----------|---------|-------------|
+| `AWS/EC2` | CPUUtilization, NetworkIn/Out | EC2 instance metrics |
+| `AWS/ELB` | RequestCount, Latency | Load balancer metrics |
+| `AWS/Lambda` | Invocations, Errors, Duration | Lambda function metrics |
+| `AWS/RDS` | CPUUtilization, Connections | Database metrics |
+| `CWAgent` | Memory, Disk, Custom | Enhanced monitoring |
+
+## 🔔 Setting Up Alerts
+
+### 1. Create SNS Topic
+
+```bash
+aws sns create-topic --name grafana-alerts
+aws sns subscribe --topic-arn arn:aws:sns:region:account:grafana-alerts \
+  --protocol email --notification-endpoint your-email@example.com
+```
+
+### 2. Add to Terraform
+
+```hcl
+sns_topic_arn = "arn:aws:sns:us-east-1:123456789012:grafana-alerts"
+```
+
+## 📊 Custom Dashboard Examples
+
+### EC2 Instance Overview
+
+```json
+{
+  "dashboard": {
+    "title": "EC2 Overview",
+    "panels": [
+      {
+        "title": "CPU Utilization",
+        "type": "graph",
+        "targets": [
+          {
+            "refId": "A",
+            "region": "us-east-1",
+            "namespace": "AWS/EC2",
+            "metricName": "CPUUtilization",
+            "dimensions": {
+              "InstanceId": "i-1234567890abcdef0"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## 🔧 Troubleshooting
+
+### Grafana Not Starting
+
+```bash
+# Check Grafana status
+sudo systemctl status grafana-server
+
+# Check logs
+sudo journalctl -u grafana-server -f
+
+# Check Docker (if using Docker setup)
+docker logs grafana
+```
+
+### CloudWatch Access Issues
+
+```bash
+# Check IAM permissions
+aws iam get-role-policy --role-name grafana-monitoring-grafana-role \
+  --policy-name grafana-monitoring-cloudwatch-policy
+
+# Test CloudWatch access
+aws cloudwatch list-metrics --namespace AWS/EC2
+```
+
+### Connection Issues
+
+```bash
+# Check security group
+aws ec2 describe-security-groups --group-ids sg-xxxxxxxxx
+
+# Check instance status
+aws ec2 describe-instances --instance-ids i-xxxxxxxxx
+```
+
+## 💰 Cost Estimate
+
+Monthly costs for `t3.medium` instance:
+
+- **EC2 Instance**: ~$30/month
+- **EBS Storage (20GB)**: ~$2/month  
+- **Elastic IP**: ~$3.65/month
+- **CloudWatch API calls**: ~$1-5/month
+- **Data transfer**: Varies
+
+**Total**: ~$40-45/month
+
+## 🔄 Updates and Maintenance
+
+### Update Grafana
+
+```bash
+# Docker method
+cd /opt/grafana
+docker-compose pull
+docker-compose up -d
+
+# Package method
+sudo yum update grafana
+sudo systemctl restart grafana-server
+```
+
+### Backup Configuration
+
+```bash
+# Backup Grafana database
+sudo cp /var/lib/grafana/grafana.db ~/grafana-backup-$(date +%Y%m%d).db
+
+# Backup dashboards
+curl -s http://admin:password@localhost:3000/api/search?query=& | \
+  jq -r '.[].uri' | \
+  xargs -I {} curl -s http://admin:password@localhost:3000/api/dashboards/{} > dashboards-backup.json
+```
+
+## 🧹 Cleanup
+
+```bash
+cd terraform
+terraform destroy
+
+# Verify cleanup
+aws ec2 describe-instances --filters "Name=tag:Project,Values=Grafana Monitoring"
+```
+
+## 📚 Additional Resources
+
+- [Grafana Documentation](https://grafana.com/docs/)
+- [CloudWatch Metrics](https://docs.aws.amazon.com/cloudwatch/latest/monitoring/aws-services-cloudwatch-metrics.html)
+- [Grafana CloudWatch Plugin](https://grafana.com/docs/grafana/latest/datasources/cloudwatch/)
+
+## 🤝 Contributing
+
+Feel free to submit issues and enhancement requests!
+
+## 📄 License
+
+MIT License
+```
+
+---
+
+## 🚀 Deployment Commands
+
+```bash
+# Generate SSH key (if needed)
+ssh-keygen -t rsa -b 4096 -f ~/.ssh/grafana-key
+
+# Setup
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your values
+
+# Deploy
+terraform init
+terraform plan
+terraform apply
+
+# Get access info
+terraform output grafana_url
+terraform output grafana_credentials
+```
+
+This complete setup gives you:
+
+✅ **Production-ready Grafana**  
+✅ **CloudWatch integration**  
+✅ **Automated deployment**  
+✅ **Security best practices**  
+✅ **Monitoring and alerting**  
+✅ **Easy maintenance**  
+
+The Grafana instance will be accessible at `http://your-ip:3000` with CloudWatch datasource pre-configured! 🎉
